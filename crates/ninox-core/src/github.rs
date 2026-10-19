@@ -488,8 +488,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Unix epoch milliseconds. Returns `0` for anything unparseable rather than
 /// failing the whole fetch over one bad timestamp.
 pub(crate) fn parse_github_timestamp(s: &str) -> i64 {
-    let b = s.as_bytes();
-    if b.len() < 19 {
+    // Byte-sliced below, so non-ASCII input would panic mid-char.
+    if s.len() < 19 || !s.is_ascii() {
         return 0;
     }
     let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min), Ok(sec)) = (
@@ -638,6 +638,8 @@ mod tests {
     #[test]
     fn parse_github_timestamp_returns_zero_for_garbage() {
         assert_eq!(parse_github_timestamp("not-a-timestamp"), 0);
+        // A multibyte char where a slice boundary falls must not panic.
+        assert_eq!(parse_github_timestamp("2024-01-0€T03:04:05Z"), 0);
     }
 
     fn init_repo(dir: &std::path::Path) {

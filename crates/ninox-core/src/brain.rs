@@ -696,14 +696,18 @@ fn sanitize_fts_query(text: &str) -> String {
         .join(" ")
 }
 
+/// Byte budget for [`embedding_text`].
+const EMBEDDING_TEXT_MAX_BYTES: usize = 2000;
+
 /// Text an entry is embedded from: name plus body, truncated to a bounded
 /// length. Small embedding models have a limited token context; truncating
-/// to a character prefix is a pragmatic approximation, not a guarantee the
-/// whole document is represented (see the design spec's non-goals — full
-/// chunking is out of scope).
+/// to a prefix is a pragmatic approximation, not a guarantee the whole
+/// document is represented (see the design spec's non-goals — full chunking
+/// is out of scope). The cut backs off to a char boundary so a multibyte
+/// character straddling the budget is dropped rather than split.
 fn embedding_text(rec: &FileRecord) -> String {
     let mut text = format!("{}\n\n{}", rec.name, rec.body);
-    text.truncate(2000);
+    text.truncate(text.floor_char_boundary(EMBEDDING_TEXT_MAX_BYTES));
     text
 }
 
@@ -896,6 +900,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let brain = BrainIndex::open(dir.path()).unwrap();
         (brain, dir)
+    }
+
+    #[test]
+    fn embedding_text_truncates_on_a_char_boundary() {
+        // "name\n\n" is 6 bytes; 1993 ASCII bytes puts the 3-byte '€' at
+        // bytes 1999..2002, straddling the 2000-byte cut.
+        let rec = FileRecord {
+            id: "x".into(),
+            entry_type: "concepts".into(),
+            name: "name".into(),
+            tags: vec![],
+            repos: vec![],
+            updated: None,
+            body: format!("{}€ tail", "a".repeat(1993)),
+            links: vec![],
+        };
+        let text = embedding_text(&rec);
+        assert_eq!(text.len(), 1999);
+        assert!(text.ends_with('a'));
+
+        let short = FileRecord {
+            body: "≈ × → —".into(),
+            ..rec
+        };
+        assert_eq!(embedding_text(&short), "name\n\n≈ × → —");
     }
 
     #[test]
