@@ -345,23 +345,53 @@ pub fn encode_mouse(
     Some(vec![0x1b, b'[', b'M', (32 + code) as u8, (32 + x) as u8, (32 + y) as u8])
 }
 
-/// SGR-encode a wheel event for the inner app, or None if ninox's own
-/// scrollback should consume the wheel. col/row are 0-based cells.
+/// Encode a wheel event for the inner app at 0-based cell (col, row), or
+/// None if ninox's own scrollback should consume the wheel. Honors the
+/// app's requested encoding (SGR vs X10) via `encode_mouse`.
 pub fn encode_wheel(lines_up: i32, col: usize, row: usize, mode: &TermMode) -> Option<Vec<u8>> {
-    if !mode.intersects(TermMode::MOUSE_MODE) {
-        return None;
-    }
-    let button = if lines_up > 0 { 64 } else { 65 };
-    Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes())
+    let button = if lines_up > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+    let clamp = |v: usize| v.min(u16::MAX as usize) as u16;
+    encode_mouse(
+        button,
+        MouseAction::Press,
+        Mods::NONE,
+        clamp(col),
+        clamp(row),
+        &InputModes::from_term_mode(mode),
+    )
 }
 
-/// Bytes to send the PTY for a `ScrollTerminal` message, or None if the
-/// scroll should act on ninox's own scrollback. A `local` scroll
-/// (drag-select auto-scroll) must never reach the PTY — under a
+/// Bytes to send the PTY for one line of a `ScrollTerminal` message, or
+/// None if the scroll should act on ninox's own scrollback. A `local`
+/// scroll (drag-select auto-scroll) must never reach the PTY — under a
 /// mouse-mode TUI the wheel bytes would scroll the inner app instead of
-/// extending the selection into local history.
-pub fn scroll_pty_bytes(local: bool, lines_up: i32, mode: &TermMode) -> Option<Vec<u8>> {
-    if local { None } else { encode_wheel(lines_up, 0, 0, mode) }
+/// extending the selection into local history. Likewise while the view is
+/// `scrolled_back` into that history the wheel keeps driving it. `cell` is
+/// the 0-based (col, row) under the pointer: mouse-mode apps such as
+/// OpenCode dispatch the wheel to whatever widget sits at that cell.
+pub fn scroll_pty_bytes(
+    local: bool,
+    scrolled_back: bool,
+    lines_up: i32,
+    cell: (u16, u16),
+    mode: &TermMode,
+) -> Option<Vec<u8>> {
+    if local || scrolled_back {
+        return None;
+    }
+    encode_wheel(lines_up, cell.0 as usize, cell.1 as usize, mode)
+}
+
+/// Bytes for a non-wheel button event the GUI terminal forwards to a
+/// mouse-mode app (right/middle click), or None when the app has no mouse
+/// reporting on. `cell` is 0-based (col, row).
+pub fn terminal_mouse_bytes(
+    button: MouseButton,
+    action: MouseAction,
+    cell: (u16, u16),
+    mode: &TermMode,
+) -> Option<Vec<u8>> {
+    encode_mouse(button, action, Mods::NONE, cell.0, cell.1, &InputModes::from_term_mode(mode))
 }
 
 #[cfg(test)]
@@ -445,12 +475,12 @@ mod tests {
     fn local_scroll_never_reaches_the_pty_even_in_mouse_mode() {
         let mouse = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
         // Precondition: a non-local scroll in mouse mode *does* go to the PTY.
-        assert!(scroll_pty_bytes(false, 3, &mouse).is_some());
+        assert!(scroll_pty_bytes(false, false, 3, (0, 0), &mouse).is_some());
         // The drag-autoscroll path opts out regardless of mode.
-        assert_eq!(scroll_pty_bytes(true, 3, &mouse), None);
-        assert_eq!(scroll_pty_bytes(true, -3, &mouse), None);
+        assert_eq!(scroll_pty_bytes(true, false, 3, (0, 0), &mouse), None);
+        assert_eq!(scroll_pty_bytes(true, false, -3, (0, 0), &mouse), None);
         // Without mouse mode, non-local scrolls stay local too.
-        assert_eq!(scroll_pty_bytes(false, 3, &TermMode::empty()), None);
+        assert_eq!(scroll_pty_bytes(false, false, 3, (0, 0), &TermMode::empty()), None);
     }
 
     #[test]
@@ -464,6 +494,61 @@ mod tests {
         assert_eq!(
             encode_wheel(-1, 5, 3, &(TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)),
             Some(b"\x1b[<65;6;4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn wheel_is_reported_at_the_pointer_cell() {
+        // OpenCode (and any mouse-mode TUI) routes a wheel event to the
+        // widget under the reported cell. Reporting every wheel at (1,1)
+        // scrolled the top-left corner, not the transcript under the
+        // pointer — so scrolling appeared to do nothing.
+        let mouse = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(
+            scroll_pty_bytes(false, false, 2, (40, 12), &mouse),
+            Some(b"\x1b[<64;41;13M".to_vec())
+        );
+        assert_eq!(
+            scroll_pty_bytes(false, false, -1, (7, 30), &mouse),
+            Some(b"\x1b[<65;8;31M".to_vec())
+        );
+    }
+
+    #[test]
+    fn wheel_honors_x10_encoding_when_sgr_is_off() {
+        // MOUSE_MODE without SGR_MOUSE: the app asked for the legacy
+        // encoding and would misparse an SGR sequence.
+        let x10 = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            encode_wheel(1, 2, 3, &x10),
+            Some(vec![0x1b, b'[', b'M', 32 + 64, 32 + 3, 32 + 4])
+        );
+    }
+
+    #[test]
+    fn wheel_scrolls_local_history_while_scrolled_back() {
+        // Once the view is scrolled back into ninox's history (e.g. a drag
+        // auto-scroll), the wheel must keep moving that history — sending
+        // it to the app would leave the view stranded off-screen.
+        let mouse = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(scroll_pty_bytes(false, true, -3, (4, 4), &mouse), None);
+        assert_eq!(scroll_pty_bytes(false, true, 3, (4, 4), &mouse), None);
+    }
+
+    #[test]
+    fn right_click_is_forwarded_only_in_mouse_mode() {
+        let mouse = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(
+            terminal_mouse_bytes(MouseButton::Right, MouseAction::Press, (9, 4), &mouse),
+            Some(b"\x1b[<2;10;5M".to_vec())
+        );
+        assert_eq!(
+            terminal_mouse_bytes(MouseButton::Right, MouseAction::Release, (9, 4), &mouse),
+            Some(b"\x1b[<2;10;5m".to_vec())
+        );
+        assert_eq!(
+            terminal_mouse_bytes(MouseButton::Right, MouseAction::Press, (9, 4), &TermMode::empty()),
+            None
         );
     }
 

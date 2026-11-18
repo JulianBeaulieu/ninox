@@ -641,6 +641,10 @@ pub struct SelectionState {
     /// Trackpads emit many sub-row pixel deltas. Preserve the fractional
     /// motion instead of truncating every event independently.
     scroll_pixel_remainder: f32,
+    /// A right/middle button whose press was forwarded to a mouse-mode app;
+    /// its release is forwarded too (even outside the canvas) so the app
+    /// never sees an unpaired press.
+    forwarded_button: Option<iced::mouse::Button>,
 }
 
 impl SelectionState {
@@ -702,6 +706,14 @@ impl SelectionState {
         let lines = (total / cell_height).trunc() as i32;
         self.scroll_pixel_remainder = total - lines as f32 * cell_height;
         lines
+    }
+}
+
+fn input_button(button: iced::mouse::Button) -> crate::input::MouseButton {
+    match button {
+        iced::mouse::Button::Right => crate::input::MouseButton::Right,
+        iced::mouse::Button::Middle => crate::input::MouseButton::Middle,
+        _ => crate::input::MouseButton::Left,
     }
 }
 
@@ -838,6 +850,13 @@ impl<'a> TerminalWidget<'a> {
         let (visual_col, row) =
             SelectionState::pixel_to_cell(x, y, cell_w, cell_h, cols, rows);
         self.visual_to_logical_cell(visual_col, row)
+    }
+
+    /// Whether button events go to the inner app: it has mouse reporting
+    /// on and the view is showing the live screen (not ninox's history).
+    fn forwards_mouse(&self) -> bool {
+        self.state.term.mode().intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+            && !self.state.is_scrolled_back()
     }
 
     fn visual_to_logical_cell(&self, visual_col: usize, row: usize) -> (usize, usize) {
@@ -1107,6 +1126,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                                     session_id: self.session_id.clone(),
                                     delta: 3,
                                     local: true,
+                                    cell: (col as u16, 0),
                                 }),
                             );
                         } else if pos.y > bounds.y + bounds.height {
@@ -1125,6 +1145,7 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
                                     session_id: self.session_id.clone(),
                                     delta: -3,
                                     local: true,
+                                    cell: (col as u16, row as u16),
                                 }),
                             );
                         }
@@ -1222,24 +1243,80 @@ impl<'a> iced::widget::canvas::Program<Message> for TerminalWidget<'a> {
             }
 
             Event::Mouse(MouseEvent::WheelScrolled { delta }) => {
-                if cursor.position_in(bounds).is_none() {
+                let Some(pos) = cursor.position_in(bounds) else {
                     return (iced::widget::canvas::event::Status::Ignored, None);
-                }
+                };
 
                 // Positive y = scroll up into history. Fractional trackpad
                 // motion is retained in canvas state until it crosses a row.
                 let lines = state.consume_scroll_delta(delta, cell_h);
                 if lines != 0 {
+                    // The pointer's grid cell: a mouse-mode app (OpenCode)
+                    // scrolls whichever widget sits under the reported
+                    // cell, so the wheel must be reported where it happened.
+                    let (col, row) =
+                        self.pixel_to_logical_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
                     return (
                         iced::widget::canvas::event::Status::Captured,
                         Some(Message::ScrollTerminal {
                             session_id: self.session_id.clone(),
                             delta: lines,
                             local: false,
+                            cell: (col as u16, row as u16),
                         }),
                     );
                 }
                 return (iced::widget::canvas::event::Status::Captured, None);
+            }
+
+            // Right/middle click belong to the inner app when it has mouse
+            // reporting on (OpenCode's right-click actions, for instance).
+            // ninox has no local right/middle action in the terminal, so
+            // without mouse mode — or while scrolled back into ninox's own
+            // history — they stay Ignored, exactly as before.
+            Event::Mouse(MouseEvent::ButtonPressed(button @ (Button::Right | Button::Middle))) => {
+                let Some(pos) = cursor.position_in(bounds) else {
+                    return (iced::widget::canvas::event::Status::Ignored, None);
+                };
+                if !self.forwards_mouse() {
+                    return (iced::widget::canvas::event::Status::Ignored, None);
+                }
+                let (col, row) =
+                    self.pixel_to_logical_cell(pos.x, pos.y, cell_w, cell_h, cols, rows);
+                state.forwarded_button = Some(*button);
+                return (
+                    iced::widget::canvas::event::Status::Captured,
+                    Some(Message::TerminalMouse {
+                        session_id: self.session_id.clone(),
+                        button: input_button(*button),
+                        action: crate::input::MouseAction::Press,
+                        cell: (col as u16, row as u16),
+                    }),
+                );
+            }
+
+            Event::Mouse(MouseEvent::ButtonReleased(button @ (Button::Right | Button::Middle)))
+                if state.forwarded_button == Some(*button) =>
+            {
+                state.forwarded_button = None;
+                // Clamp to the grid: the release may land outside the canvas.
+                let (col, row) = cursor
+                    .position()
+                    .map(|p| {
+                        let x = (p.x - bounds.x).clamp(0.0, bounds.width.max(0.0));
+                        let y = (p.y - bounds.y).clamp(0.0, bounds.height.max(0.0));
+                        self.pixel_to_logical_cell(x, y, cell_w, cell_h, cols, rows)
+                    })
+                    .unwrap_or((0, 0));
+                return (
+                    iced::widget::canvas::event::Status::Captured,
+                    Some(Message::TerminalMouse {
+                        session_id: self.session_id.clone(),
+                        button: input_button(*button),
+                        action: crate::input::MouseAction::Release,
+                        cell: (col as u16, row as u16),
+                    }),
+                );
             }
 
             _ => {}
@@ -3474,6 +3551,131 @@ mod tests {
                 );
             }
             other => panic!("expected ScrollTerminal, got {other:?}"),
+        }
+    }
+
+    fn mouse_test_bounds() -> Rectangle {
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        Rectangle::new(
+            iced::Point::new(0.0, 100.0),
+            Size::new(80.0 * cell_w, 24.0 * cell_h),
+        )
+    }
+
+    /// Centre of 0-based cell (col, row) inside `mouse_test_bounds`.
+    fn cell_point(col: usize, row: usize) -> iced::Point {
+        let (cell_w, cell_h) = cell_size(FONT_SIZE);
+        let b = mouse_test_bounds();
+        iced::Point::new(
+            b.x + cell_w * (col as f32 + 0.5),
+            b.y + cell_h * (row as f32 + 0.5),
+        )
+    }
+
+    #[test]
+    fn wheel_reports_the_pointer_cell_not_the_origin() {
+        // Regression: OpenCode scrolls the widget under the reported cell;
+        // every wheel used to be reported at (1,1), so it never scrolled.
+        use iced::widget::canvas::Program;
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"\x1b[?1002h\x1b[?1006h");
+        let widget = test_widget(&s);
+        let mut state = SelectionState::default();
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            mouse_test_bounds(),
+            iced::mouse::Cursor::Available(cell_point(40, 12)),
+        );
+        match message {
+            Some(Message::ScrollTerminal { local: false, cell, delta, .. }) => {
+                assert_eq!(cell, (40, 12));
+                assert!(delta < 0);
+                assert_eq!(
+                    crate::input::scroll_pty_bytes(false, false, delta, cell, s.term.mode()),
+                    Some(b"\x1b[<65;41;13M".to_vec())
+                );
+            }
+            other => panic!("expected a PTY ScrollTerminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_is_forwarded_in_mouse_mode_with_paired_release() {
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+        let mut s = TerminalState::new(80, 24, None);
+        s.process(b"\x1b[?1000h\x1b[?1006h");
+        let widget = test_widget(&s);
+        let mut state = SelectionState::default();
+        let bounds = mouse_test_bounds();
+
+        let (status, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Right)),
+            bounds,
+            iced::mouse::Cursor::Available(cell_point(9, 4)),
+        );
+        assert_eq!(status, iced::widget::canvas::event::Status::Captured);
+        match message {
+            Some(Message::TerminalMouse { button, action, cell, .. }) => {
+                assert_eq!(button, crate::input::MouseButton::Right);
+                assert_eq!(action, crate::input::MouseAction::Press);
+                assert_eq!(cell, (9, 4));
+            }
+            other => panic!("expected TerminalMouse press, got {other:?}"),
+        }
+
+        // Release outside the canvas still reaches the app, clamped.
+        let outside = iced::Point::new(bounds.x + bounds.width + 50.0, bounds.y - 30.0);
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonReleased(Button::Right)),
+            bounds,
+            iced::mouse::Cursor::Available(outside),
+        );
+        match message {
+            Some(Message::TerminalMouse { action, cell, .. }) => {
+                assert_eq!(action, crate::input::MouseAction::Release);
+                assert_eq!(cell, (79, 0));
+            }
+            other => panic!("expected TerminalMouse release, got {other:?}"),
+        }
+        assert!(state.forwarded_button.is_none());
+        // Left-button selection is untouched: still ninox's own.
+        let (_, message) = widget.update(
+            &mut state,
+            iced::widget::canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            iced::mouse::Cursor::Available(cell_point(2, 2)),
+        );
+        assert!(message.is_none());
+        assert!(state.dragging);
+    }
+
+    #[test]
+    fn right_click_stays_ignored_without_mouse_mode() {
+        // Claude Code / plain shells don't enable mouse reporting: nothing
+        // must be written to their PTY.
+        use iced::mouse::Button;
+        use iced::widget::canvas::Program;
+        let s = TerminalState::new(80, 24, None);
+        let widget = test_widget(&s);
+        let mut state = SelectionState::default();
+        for event in [
+            iced::mouse::Event::ButtonPressed(Button::Right),
+            iced::mouse::Event::ButtonReleased(Button::Right),
+        ] {
+            let (status, message) = widget.update(
+                &mut state,
+                iced::widget::canvas::Event::Mouse(event),
+                mouse_test_bounds(),
+                iced::mouse::Cursor::Available(cell_point(9, 4)),
+            );
+            assert_eq!(status, iced::widget::canvas::event::Status::Ignored);
+            assert!(message.is_none());
         }
     }
 

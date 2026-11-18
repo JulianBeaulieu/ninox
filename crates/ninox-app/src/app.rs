@@ -633,7 +633,19 @@ pub enum Message {
     /// mouse mode enabled; `local: true` (drag-select auto-scroll) always
     /// moves ninox's own scrollback so selections can extend into history
     /// even under a mouse-mode TUI.
-    ScrollTerminal { session_id: SessionId, delta: i32, local: bool },
+    /// `cell` is the 0-based (col, row) under the pointer; a forwarded
+    /// wheel is reported there so mouse-mode apps scroll the widget the
+    /// user is pointing at (ignored for local scrolls).
+    ScrollTerminal { session_id: SessionId, delta: i32, local: bool, cell: (u16, u16) },
+    /// A right/middle button press or release over a terminal whose inner
+    /// app has mouse reporting on — forwarded to the PTY at `cell`
+    /// (0-based col, row). Left button stays ninox's (selection, links).
+    TerminalMouse {
+        session_id: SessionId,
+        button: crate::input::MouseButton,
+        action: crate::input::MouseAction,
+        cell: (u16, u16),
+    },
     JumpToLatest { session_id: SessionId },
     /// A chunk of tmux pane history came back from `capture-pane` for a
     /// scrolled-back terminal.
@@ -4006,15 +4018,32 @@ impl App {
                 Task::none()
             }
 
-            Message::ScrollTerminal { session_id, delta, local } => {
+            Message::ScrollTerminal { session_id, delta, local, cell } => {
                 if let Some(term) = state.terminals.get_mut(&session_id) {
                     let mode = *term.term.mode();
-                    if let Some(bytes) = crate::input::scroll_pty_bytes(local, delta, &mode) {
+                    let scrolled_back = term.is_scrolled_back();
+                    if let Some(bytes) =
+                        crate::input::scroll_pty_bytes(local, scrolled_back, delta, cell, &mode)
+                    {
                         if let Some(client) = state.clients.get(&session_id) {
                             for _ in 0..delta.unsigned_abs() { client.write(bytes.clone()); }
                         }
                     } else if term.scroll(delta) {
                         return start_history_fetch(state, &session_id);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::TerminalMouse { session_id, button, action, cell } => {
+                if let Some(term) = state.terminals.get(&session_id) {
+                    let mode = *term.term.mode();
+                    if let Some(bytes) =
+                        crate::input::terminal_mouse_bytes(button, action, cell, &mode)
+                    {
+                        if let Some(client) = state.clients.get(&session_id) {
+                            client.write(bytes);
+                        }
                     }
                 }
                 Task::none()
