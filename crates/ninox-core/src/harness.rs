@@ -56,6 +56,22 @@ pub struct HarnessRegistry {
     specs: BTreeMap<String, HarnessSpec>,
 }
 
+/// The OpenCode harness name. Its launches get [`OPENCODE_PRIVATE_SERVER_FLAG`].
+pub const OPENCODE: &str = "opencode";
+
+/// Runs OpenCode's server inside the launched process instead of attaching
+/// to the shared background service (`opencode serve --service`).
+///
+/// That service is one detached process (parented by launchd) for every
+/// OpenCode TUI on the machine, and OpenCode runs the agent's shell tool
+/// inside it. So without this flag a ninox session's commands neither
+/// descend from its tmux pane nor see the pane's `NINOX_*` environment:
+/// they carry whatever environment the service happened to be started
+/// with — possibly another session's — and every pane-authorized command
+/// (`receive-completion`, `workers`, `complete`) fails with "caller is not
+/// running inside a private Ninox pane".
+pub const OPENCODE_PRIVATE_SERVER_FLAG: &str = "--standalone";
+
 /// Compiled-in default specs. Launch shapes preserve the exact commands the
 /// old `AgentConfig::interactive_cmd`/`worker_cmd` built (regression-tested
 /// below); the only delta is that substituted values are shell-quoted.
@@ -77,11 +93,9 @@ fn builtin_specs() -> BTreeMap<String, HarnessSpec> {
             "--model".into(), "{model}".into(),
         ],
         known_models:     vec![
-            "claude-fable-5-1".into(),
-            "claude-fable-5".into(),
-            "claude-opus-4-8".into(),
-            "claude-sonnet-5".into(),
-            "claude-haiku-4-5".into(),
+            "claude-opus-5-5".into(),
+            "claude-sonnet-5-5".into(),
+            "claude-haiku-4-5-20251001".into(),
         ],
         ..HarnessSpec::default()
     });
@@ -152,6 +166,23 @@ impl HarnessRegistry {
         self.names().into_iter().filter(|n| self.specs[n].enabled).collect()
     }
 
+    /// Flags that go right after the binary, ahead of the spec's own args.
+    /// OpenCode launches always get [`OPENCODE_PRIVATE_SERVER_FLAG`] — even
+    /// under a custom `[harnesses.opencode]` spec, since config files persist
+    /// the args they were written with — unless the spec already chooses a
+    /// server itself (`--standalone` or `--server <url>`).
+    fn launch_prefix(&self, harness: &str, spec_args: &[String]) -> Vec<String> {
+        if harness == OPENCODE
+            && !spec_args.iter().any(|a| {
+                a == OPENCODE_PRIVATE_SERVER_FLAG || a == "--server" || a.starts_with("--server=")
+            })
+        {
+            vec![OPENCODE_PRIVATE_SERVER_FLAG.into()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Interactive launch command (orchestrator / standalone sessions).
     /// `claude_session_id` is the UUID ninox generated for this spawn (see
     /// `new_claude_session_id`) — always required so every claude-code
@@ -160,7 +191,9 @@ impl HarnessRegistry {
         let spec   = self.spec(&agent.harness);
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        join_cmd(binary, expand_args(&spec.interactive_args, model, None, claude_session_id))
+        let mut args = self.launch_prefix(&agent.harness, &spec.interactive_args);
+        args.extend(expand_args(&spec.interactive_args, model, None, claude_session_id));
+        join_cmd(binary, args)
     }
 
     /// Worker launch command, or `None` when the spec has no `worker_args`
@@ -170,7 +203,9 @@ impl HarnessRegistry {
         let wargs  = spec.worker_args.as_ref()?;
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        Some(join_cmd(binary, expand_args(wargs, model, Some(prompt), claude_session_id)))
+        let mut args = self.launch_prefix(&agent.harness, wargs);
+        args.extend(expand_args(wargs, model, Some(prompt), claude_session_id));
+        Some(join_cmd(binary, args))
     }
 
     /// Resume command for a previously-interrupted session, or `None` when
@@ -186,7 +221,9 @@ impl HarnessRegistry {
         }
         let binary = spec.binary.clone().unwrap_or_else(|| agent.harness.clone());
         let model  = agent.model.as_deref().or(spec.model.as_deref());
-        Some(join_cmd(binary, expand_args(&spec.resume_args, model, None, claude_session_id)))
+        let mut args = self.launch_prefix(&agent.harness, &spec.resume_args);
+        args.extend(expand_args(&spec.resume_args, model, None, claude_session_id));
+        Some(join_cmd(binary, args))
     }
 }
 
@@ -396,6 +433,60 @@ mod tests {
     fn resume_cmd_none_for_harness_without_resume_args() {
         // codex's builtin spec has no resume_args — resuming isn't supported.
         assert!(reg().resume_cmd(&agent("codex", Some("gpt-4o")), "sess-1").is_none());
+    }
+
+    // ── OpenCode private server ─────────────────────────────────────────────
+
+    #[test]
+    fn opencode_launches_run_a_private_server_in_the_pane() {
+        let r = reg();
+        assert_eq!(r.interactive_cmd(&agent("opencode", Some("m")), "sess-1"),
+                   "opencode --standalone --model 'm'");
+        assert_eq!(r.worker_cmd(&agent("opencode", None), "do it", "sess-1").unwrap(),
+                   "opencode --standalone -p 'do it'");
+    }
+
+    #[test]
+    fn opencode_private_server_survives_a_custom_spec() {
+        // The user's config.toml persists `[harnesses.opencode]` with the args
+        // it was written with; those must not route tools to the shared service.
+        let mut over = BTreeMap::new();
+        over.insert("opencode".to_string(), HarnessSpec {
+            enabled: true,
+            interactive_args: vec!["--model".into(), "{model}".into()],
+            worker_args: Some(vec!["--model".into(), "{model}".into(), "-p".into(), "{prompt}".into()]),
+            resume_args: vec!["--session".into(), "{session_id}".into()],
+            ..HarnessSpec::default()
+        });
+        let r = HarnessRegistry::from_config(&over);
+        assert_eq!(r.interactive_cmd(&agent("opencode", Some("m")), "s"), "opencode --standalone --model 'm'");
+        assert_eq!(r.worker_cmd(&agent("opencode", Some("m")), "p", "s").unwrap(),
+                   "opencode --standalone --model 'm' -p 'p'");
+        assert_eq!(r.resume_cmd(&agent("opencode", None), "s").unwrap(), "opencode --standalone --session 's'");
+    }
+
+    #[test]
+    fn opencode_spec_that_picks_its_own_server_is_left_alone() {
+        for args in [
+            vec!["--standalone".to_string()],
+            vec!["--server".to_string(), "http://127.0.0.1:4096".to_string()],
+            vec!["--server=http://127.0.0.1:4096".to_string()],
+        ] {
+            let mut over = BTreeMap::new();
+            over.insert("opencode".to_string(), HarnessSpec {
+                interactive_args: args.clone(),
+                ..HarnessSpec::default()
+            });
+            let r = HarnessRegistry::from_config(&over);
+            assert_eq!(r.interactive_cmd(&agent("opencode", None), "s"), format!("opencode {}", args.join(" ")));
+        }
+    }
+
+    #[test]
+    fn private_server_flag_is_opencode_only() {
+        let r = reg();
+        assert_eq!(r.interactive_cmd(&agent("claude-code", None), "s"), "claude --session-id 's'");
+        assert_eq!(r.interactive_cmd(&agent("codex", None), "s"), "codex");
     }
 
     #[test]

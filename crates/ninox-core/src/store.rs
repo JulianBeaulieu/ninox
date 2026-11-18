@@ -490,6 +490,18 @@ pub(crate) struct WorkerCleanupSnapshotClaim {
 }
 
 
+/// Longest wait between two nudges for one unacknowledged completion.
+pub const MAX_COMPLETION_RETRY_MS: i64 = 30 * 60 * 1000;
+
+/// Delay after delivery `attempt` (1-based) before the next one:
+/// `base_ms`, then doubling, capped at [`MAX_COMPLETION_RETRY_MS`].
+pub fn completion_retry_delay_ms(base_ms: i64, attempt: i64) -> i64 {
+    let doublings = attempt.saturating_sub(1).clamp(0, 32) as u32;
+    base_ms
+        .saturating_mul(1_i64 << doublings)
+        .min(MAX_COMPLETION_RETRY_MS.max(base_ms))
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let database_path = path.as_ref().to_path_buf();
@@ -2514,6 +2526,11 @@ impl Store {
         Ok(WorkerCompletionIntent::Completed(completion))
     }
 
+    /// Claims the next due completion nudge. `retry_after_ms` is the delay
+    /// before the *first* retry; each later one doubles it, up to
+    /// [`MAX_COMPLETION_RETRY_MS`] (see [`completion_retry_delay_ms`]) — an
+    /// orchestrator that cannot or does not acknowledge is reminded less and
+    /// less often instead of every poll forever.
     pub fn claim_worker_completion_delivery(
         &self,
         now: i64,
@@ -2545,7 +2562,7 @@ impl Store {
         let attempt = attempts
             .checked_add(1)
             .context("completion delivery attempt counter overflowed")?;
-        let next_attempt_at = now.saturating_add(retry_after_ms);
+        let next_attempt_at = now.saturating_add(completion_retry_delay_ms(retry_after_ms, attempt));
         let changed = tx.execute(
             "UPDATE worker_completion_outbox
              SET attempt_count=?2,next_attempt_at=?3
@@ -7106,6 +7123,32 @@ mod tests {
             .unwrap();
         assert_eq!(retry.completion.completion_id, completion_id);
         assert_eq!(retry.attempt, 2);
+    }
+
+    #[test]
+    fn completion_retry_delay_doubles_then_caps() {
+        assert_eq!(completion_retry_delay_ms(30_000, 1), 30_000);
+        assert_eq!(completion_retry_delay_ms(30_000, 2), 60_000);
+        assert_eq!(completion_retry_delay_ms(30_000, 3), 120_000);
+        assert_eq!(completion_retry_delay_ms(30_000, 7), MAX_COMPLETION_RETRY_MS);
+        assert_eq!(completion_retry_delay_ms(30_000, 10_000), MAX_COMPLETION_RETRY_MS);
+    }
+
+    #[test]
+    fn unacknowledged_delivery_backs_off_between_retries() {
+        let store = test_store();
+        let worker = completion_fixture(&store, "worker");
+        store
+            .complete_worker_incarnation("worker", &worker.incarnation_id, "orch", "back off", 100)
+            .unwrap();
+        let first = store.claim_worker_completion_delivery(101, 30_000).unwrap().unwrap();
+        assert_eq!(first.attempt, 1);
+        let second = store.claim_worker_completion_delivery(30_101, 30_000).unwrap().unwrap();
+        assert_eq!(second.attempt, 2);
+        // The third nudge waits twice as long as the second did.
+        assert!(store.claim_worker_completion_delivery(90_100, 30_000).unwrap().is_none());
+        let third = store.claim_worker_completion_delivery(90_101, 30_000).unwrap().unwrap();
+        assert_eq!(third.attempt, 3);
     }
 
     #[test]
