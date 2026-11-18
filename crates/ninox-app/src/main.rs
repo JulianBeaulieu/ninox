@@ -2589,6 +2589,17 @@ pub(crate) async fn spawn_orchestrator_common(
         let _ = store.delete_orchestrator(&id);
         return Err(e);
     }
+    // Same as the app's spawn path (`spawn_util`): pin the orchestrator's
+    // immutable runtime identity now. Without it the orchestrator can never
+    // pass `authorize_orchestrator` — this row has no `pid` for the lazy
+    // migration path to match — so `receive-completion` and `ninox workers`
+    // refuse it and every worker completion is re-nudged forever.
+    if let Err(e) = ninox_core::workers::register_live_orchestrator_runtime(store, &id).await {
+        let _ = ninox_core::tmux::kill_private_session(&id).await;
+        let _ = store.delete_session(&id);
+        let _ = store.delete_orchestrator(&id);
+        return Err(e.context("orchestrator runtime registration failed"));
+    }
 
     if let Some(brief) = prompt {
         // Typing at a harness that hasn't drawn its input box yet is swallowed
