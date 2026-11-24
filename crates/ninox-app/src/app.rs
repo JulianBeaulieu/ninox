@@ -135,6 +135,17 @@ fn checkout_capacity_for_worker(
     checkout_capacity(config, workspace)
 }
 
+/// The `started_at` a resumed session is written back with. A worker resume
+/// reuses its current incarnation, and `(session id, incarnation
+/// started_at)` is the snapshot key that finalize (`ninox reap` / `workers
+/// finalize`) and cleanup (sidebar ✕) match the session row by — stamping
+/// "now" here made both silently miss the row: the worker stayed "killed"
+/// in the sidebar and every ✕ was undone by the next refresh. Orchestrators
+/// have no incarnation and keep the fresh timestamp.
+fn resume_started_at(worker: Option<&ninox_core::types::WorkerIncarnation>, now: i64) -> i64 {
+    worker.map_or(now, |worker| worker.started_at)
+}
+
 struct RuntimeStartGuard {
     store: Arc<ninox_core::store::Store>,
     claim: Option<ninox_core::types::WorkerRuntimeClaim>,
@@ -3024,10 +3035,13 @@ impl App {
                 // Diff panel refetches instead of showing the pre-resume text.
                 state.diffs.remove(&id);
 
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
+                let ts = resume_started_at(
+                    runtime_claim.as_ref().map(|claim| &claim.claim().worker),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                );
                 let engine  = state.engine.clone();
                 let name    = session.name.clone();
                 let repo    = session.repo.clone();
@@ -6300,6 +6314,24 @@ mod tests {
         let (next, _) = m.update(Message::PollSessions);
         m = next;
         assert!(!m.diffs.contains_key("w1"), "a session purged from the store must not leak its cached diff");
+    }
+
+    #[test]
+    fn resumed_worker_keeps_its_incarnation_started_at() {
+        let worker = ninox_core::types::WorkerIncarnation {
+            session_id: "w".into(),
+            incarnation_id: "inc".into(),
+            orchestrator_id: Some("o".into()),
+            started_at: 1_000,
+            source_workspace: String::new(),
+            workspace_path: String::new(),
+            repository_key: None,
+            lease_id: None,
+            checkout_backed: false,
+            state: ninox_core::types::WorkerIncarnationState::Active,
+        };
+        assert_eq!(resume_started_at(Some(&worker), 9_999), 1_000);
+        assert_eq!(resume_started_at(None, 9_999), 9_999);
     }
 
     #[test]
